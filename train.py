@@ -29,7 +29,7 @@ hyp = {'giou': 3.54,  # giou loss gain
        'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
        'iou_t': 0.20,  # iou training threshold
-       'lr0': 0.01,  # initial learning rate (SGD=5E-3, Adam=5E-4)
+       'lr0': 0.001,  # initial learning rate (SGD=5E-3, Adam=5E-4)
        'lrf': 0.0005,  # final learning rate (with cos scheduler)
        'momentum': 0.937,  # SGD momentum
        'weight_decay': 0.0005,  # optimizer weight decay
@@ -227,6 +227,10 @@ def train(hyp):
     # Model EMA
     ema = torch_utils.ModelEMA(model)
 
+    # ADMM
+    if opt.admm:
+        admm = admm_op(model, b=opt.bits, admm_iter=opt.admm_iter)
+
     # Start training
     nb = len(dataloader)  # number of batches
     n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
@@ -291,6 +295,8 @@ def train(hyp):
                     scaled_loss.backward()
             else:
                 loss.backward()
+            if opt.admm:
+                admm.loss_grad()
 
             # Optimize
             if ni % accumulate == 0:
@@ -317,10 +323,22 @@ def train(hyp):
         # Update scheduler
         scheduler.step()
 
+        # ADMM
+        if opt.admm:
+            admm.update(epoch)
+            admm.print_info(epoch)
+    
+            if epoch == opt.epochs-1 :
+                admm.apply_quantval()
+
+
         # Process epoch results
         ema.update_attr(model)
         final_epoch = epoch + 1 == epochs
         if not opt.notest or final_epoch:  # Calculate mAP
+            if opt.admm:
+                admm.applyquantW()
+
             is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
             results, maps = test.test(cfg,
                                       data,
@@ -331,6 +349,10 @@ def train(hyp):
                                       single_cls=opt.single_cls,
                                       dataloader=testloader,
                                       multi_label=ni > n_burn)
+
+            if opt.admm:
+                admm.restoreW()
+
 
         # Write
         with open(results_file, 'a') as f:
@@ -374,12 +396,25 @@ def train(hyp):
     if len(n):
         n = '_' + n if not n.isnumeric() else n
         fresults, flast, fbest = 'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
-        for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
+        for f1, f2 in zip([wdir + 'last_uav.pt', wdir + 'best_uav.pt', 'results.txt'], [flast, fbest, fresults]):
             if os.path.exists(f1):
                 os.rename(f1, f2)  # rename
                 ispt = f2.endswith('.pt')  # is *.pt
                 strip_optimizer(f2) if ispt else None  # strip optimizer
                 os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
+
+    if opt.admm:
+        weightsdistribute(model)
+        total_bit = 0
+        total_param = 0
+        i = 0
+        for key, value in model.named_parameters():
+            if key in quantdict:
+                total_param = total_param + value.numel()
+                total_bit = total_bit + value.numel() * opt.bits[i]
+                i = i + 1
+
+        print('Aver bits: {:10d} / {:5d} = {:5.3f}'.format(total_bit, total_param, total_bit / total_param))
 
     if not opt.evolve:
         plot_results()  # save as results.png
@@ -391,10 +426,10 @@ def train(hyp):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=300)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
+    parser.add_argument('--epochs', type=int, default=200)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
     parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
-    parser.add_argument('--data', type=str, default='data/coco2017.data', help='*.data path')
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3-tiny.cfg', help='*.cfg path')
+    parser.add_argument('--data', type=str, default='data/UAV.data', help='*.data path')
     parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
     parser.add_argument('--img-size', nargs='+', type=int, default=[320, 640], help='[min_train, max-train, test]')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
@@ -404,12 +439,17 @@ if __name__ == '__main__':
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
-    parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralytics.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default='weights/yolov3-tiny.weights', help='initial weights path')
     parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
-    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
+    parser.add_argument('--device', default='3', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--adam', action='store_true', help='use adam optimizer')
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
-    parser.add_argument('--freeze-layers', action='store_true', help='Freeze non-output layers')  
+    parser.add_argument('--freeze-layers', action='store_true', help='Freeze non-output layers')
+    parser.add_argument('--admm', action='store_true', default=False, help='quantize weights using admm method')
+    parser.add_argument('--admm-iter', type=int, default=10, help='num of admm iter')
+    parser.add_argument('--rho', default=1e-4, type=float, help='admm rho parameter')
+    parser.add_argument('--bits', default=[8 for i in range(13)], type=int, nargs='*', help ='num of bits for each layer')
+
     opt = parser.parse_args()
     opt.weights = last if opt.resume and not opt.weights else opt.weights
     check_git_status()
